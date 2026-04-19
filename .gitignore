@@ -1,0 +1,61 @@
+# ── Large genomics data files (not tracked) ───────────────────────────────────
+*.sra
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+
+# Alignment files
+*.bam
+*.bai
+*.sam
+*.cram
+*.crai
+
+# Variant files
+*.vcf
+*.vcf.gz
+*.vcf.gz.tbi
+*.g.vcf
+*.g.vcf.gz
+*.g.vcf.gz.tbi
+*.bcf
+
+# GATK intermediate files
+*.recal
+*.tranches
+*.R
+*_recal.table
+*_plots.R
+*.recal.idx
+*.grp
+
+# Index and dict files (regenerable)
+*.fai
+*.dict
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+bwa_mem.log
+gatk_germline.log
+modal_gatk.log
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Editors ───────────────────────────────────────────────────────────────────
+*.swp
+*.swo
+*~
+.vscode/
+
+# ── Peak calls and counts (large/regenerable) ─────────────────────────────────
+macs3_out/
+tss_pm1000_counts.bed
