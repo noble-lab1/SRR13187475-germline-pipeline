@@ -17,8 +17,8 @@ CONDA    = Path.home() / "miniconda3" / "bin"
 MODAL    = Path.home() / "miniconda3" / "bin" / "modal"
 SAMTOOLS = Path.home() / "miniconda3" / "bin" / "samtools"
 
-MODAL_TOKEN_ID     = "ak-8OHryx1aMl2XEwM0oknuBE"
-MODAL_TOKEN_SECRET = "as-7NggUhXzihTOdJHQc1WD0R"
+# Modal credentials are auto-loaded by the CLI from ~/.modal.toml
+# (run `modal token new` once to populate). No env-var override needed.
 VOLUME_NAME        = "gatk-haplotypecaller-data"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -112,12 +112,10 @@ def show_modal_log():
 
 def show_modal_volume():
     section("Modal volume contents")
-    env = os.environ.copy()
-    env["MODAL_TOKEN_ID"]     = MODAL_TOKEN_ID
-    env["MODAL_TOKEN_SECRET"] = MODAL_TOKEN_SECRET
+    # modal CLI reads ~/.modal.toml directly — no env override.
     dirs = ["/bam", "/ref", "/shards", "/output"]
     for d in dirs:
-        r = run([str(MODAL), "volume", "ls", VOLUME_NAME, d], env=env)
+        r = run([str(MODAL), "volume", "ls", VOLUME_NAME, d])
         lines = [l for l in r.stdout.splitlines() if l.strip()]
         count = len(lines)
         if count:

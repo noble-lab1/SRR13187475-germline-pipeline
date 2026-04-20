@@ -11,9 +11,8 @@ Strategy:
   - Per-chromosome VCFs genotyped on Modal, downloaded, merged locally
 
 Credentials:
-  Hardcoded defaults are set below for convenience during development.
-  Override via CLI flags, environment variables, or `~/.modal_gatk.env`.
-  ⚠️  ROTATE THESE BEFORE SHARING THIS FILE OR COMMITTING TO GIT.
+  Modal:  read from `~/.modal.toml` (run `modal token new` once to populate).
+  NGC:    read from env var `NGC_API_KEY`, or `~/.modal_gatk.env`, or `--ngc-api-key`.
 
 Usage:
   python3 modal_gatk.py \\
@@ -29,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -41,11 +41,6 @@ HG38_URL = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz"
 
 # Manifest for resumability
 MANIFEST_PATH = Path.home() / ".modal_gatk_manifest.json"
-
-# ⚠️  Hardcoded credentials — ROTATE before sharing this file.
-DEFAULT_MODAL_TOKEN_ID     = "ak-8OHryx1aMl2XEwM0oknuBE"
-DEFAULT_MODAL_TOKEN_SECRET = "as-7NggUhXzihTOdJHQc1WD0R"
-DEFAULT_NGC_API_KEY        = "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"
 
 
 # ── Binary resolution ─────────────────────────────────────────────────────────
@@ -114,9 +109,8 @@ def save_manifest(manifest: dict):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--modal-token-id",     default=None)
-    p.add_argument("--modal-token-secret", default=None)
-    p.add_argument("--ngc-api-key",        default=None)
+    p.add_argument("--ngc-api-key", default=None,
+                   help="NGC API key (overrides env var / ~/.modal_gatk.env)")
     p.add_argument("--bam",  required=True, type=Path)
     p.add_argument("--ref",  required=True, type=Path,
                    help="Local reference (used for fai/dict only; Modal downloads its own copy)")
@@ -169,29 +163,37 @@ def chroms_from_bam(bam: Path) -> list:
 
 # ── BAM splitting ─────────────────────────────────────────────────────────────
 
-def split_bam_by_chrom(bam: Path, chroms: list, out_dir: Path, manifest: dict) -> dict:
-    """Split BAM into per-chromosome BAMs. Returns {chrom: Path}."""
+def split_bam_by_chrom(bam: Path, chroms: list, out_dir: Path, manifest: dict,
+                       max_workers: int = 6) -> dict:
+    """Split BAM into per-chromosome BAMs in parallel. Returns {chrom: Path}."""
     out_dir.mkdir(parents=True, exist_ok=True)
     chr_bams = {}
-    for chrom in chroms:
+
+    def split_one(chrom: str):
         out_bam = out_dir / f"{bam.stem}_{chrom}.bam"
         out_bai = Path(str(out_bam) + ".bai")
         if out_bam.exists() and out_bai.exists():
-            print(f"  {chrom}: already split, skipping")
-            chr_bams[chrom] = out_bam
-            manifest["split"][chrom] = str(out_bam)
-            continue
-        print(f"  Splitting {chrom}...", end=" ", flush=True)
+            return chrom, out_bam, None
         subprocess.run(
             [SAMTOOLS, "view", "-b", "-o", str(out_bam), str(bam), chrom],
-            check=True,
+            check=True, capture_output=True,
         )
-        subprocess.run([SAMTOOLS, "index", str(out_bam)], check=True)
-        size_mb = out_bam.stat().st_size / 1e6
-        print(f"{size_mb:.0f} MB")
-        chr_bams[chrom] = out_bam
-        manifest["split"][chrom] = str(out_bam)
-        save_manifest(manifest)
+        subprocess.run([SAMTOOLS, "index", str(out_bam)],
+                       check=True, capture_output=True)
+        return chrom, out_bam, out_bam.stat().st_size / 1e6
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(split_one, c): c for c in chroms}
+        for fut in as_completed(futures):
+            chrom, out_bam, size_mb = fut.result()
+            if size_mb is None:
+                print(f"  {chrom}: already split, skipping")
+            else:
+                print(f"  {chrom}: {size_mb:.0f} MB")
+            chr_bams[chrom] = out_bam
+            manifest["split"][chrom] = str(out_bam)
+
+    save_manifest(manifest)
     return chr_bams
 
 
@@ -230,32 +232,50 @@ def file_exists_in_volume(remote_path: str, cache: dict = None) -> bool:
 
 # ── Upload / Download ─────────────────────────────────────────────────────────
 
-def upload_file(local_path: Path, remote_path: str, vol_cache: dict, retries: int = 8):
-    """Upload via modal CLI with exponential backoff retries."""
-    size_mb = local_path.stat().st_size / 1e6
-    print(f"  ↑ {local_path.name}  ({size_mb:.0f} MB)", end=" ", flush=True)
-    if file_exists_in_volume(remote_path, vol_cache):
-        print("already in volume, skipping")
-        return
+def _upload_once(local_path: Path, remote_path: str, retries: int = 8):
+    """Upload a single file via modal CLI with exponential backoff. No stdout prints
+    so callers can parallelize and format output themselves."""
     for attempt in range(1, retries + 1):
         try:
             subprocess.run(
                 [MODAL_BIN, "volume", "put", "--force", VOLUME_NAME,
                  str(local_path), remote_path],
-                check=True, timeout=900,
+                check=True, timeout=900, capture_output=True,
             )
-            print("✓")
-            # Invalidate cache for that dir since we just wrote to it
-            vol_cache.pop(str(Path(remote_path).parent), None)
             return
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             if attempt < retries:
-                wait = min(2 ** attempt, 120)
-                print(f"\n    Retry {attempt}/{retries} in {wait}s: {type(e).__name__}",
-                      end=" ", flush=True)
-                time.sleep(wait)
+                time.sleep(min(2 ** attempt, 120))
             else:
                 raise RuntimeError(f"Upload failed after {retries} attempts: {e}")
+
+
+def upload_files_parallel(pairs: list, max_workers: int = 4):
+    """Upload (local_path, remote_path) pairs in parallel, skipping files
+    already present in the volume."""
+    # Prime per-directory caches once (single modal-CLI call per dir).
+    dirs = {str(Path(rp).parent) for _, rp in pairs}
+    vol_cache = {d: list_volume_dir(d) for d in dirs}
+
+    to_upload = []
+    for local, remote in pairs:
+        if Path(remote).name in vol_cache.get(str(Path(remote).parent), set()):
+            size_mb = local.stat().st_size / 1e6
+            print(f"  = {local.name} ({size_mb:.0f} MB) already in volume")
+        else:
+            to_upload.append((local, remote))
+
+    if not to_upload:
+        return
+
+    print(f"  Uploading {len(to_upload)} file(s) with {max_workers} workers...")
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_upload_once, lp, rp): (lp, rp) for lp, rp in to_upload}
+        for fut in as_completed(futures):
+            lp, rp = futures[fut]
+            fut.result()  # raises if upload ultimately failed
+            size_mb = lp.stat().st_size / 1e6
+            print(f"  ↑ {lp.name} ({size_mb:.0f} MB) ✓")
 
 
 def vol_path(container_path: str) -> str:
@@ -355,7 +375,9 @@ def run_on_modal(chroms, bam_stem, out_name, ngc_key, skip_shards=False):
         print("Reference ready.")
         return ref_path
 
-    # ── Shard: HaplotypeCaller on one chromosome ──────────────────────────────
+    # ── Shard: HaplotypeCaller + GenotypeGVCFs on one chromosome ──────────────
+    # Fused so GenotypeGVCFs runs in the same container as HC — no extra
+    # cold-start, no volume commit/reload round-trip between the two stages.
     @app.function(
         image=image,
         gpu="A100-80GB",
@@ -366,65 +388,51 @@ def run_on_modal(chroms, bam_stem, out_name, ngc_key, skip_shards=False):
         retries=1,
         serialized=True,
     )
-    def haplotypecaller_shard(chrom: str, bam_stem: str, out_prefix: str) -> dict:
+    def hc_genotype_shard(chrom: str, bam_stem: str, out_prefix: str) -> dict:
         import subprocess, os
         volume.reload()
         os.makedirs("/data/shards", exist_ok=True)
-        bam_path = f"/data/bam/{bam_stem}_{chrom}.bam"
-        ref_path = "/data/ref/hg38.fa"
-        out_gvcf = f"/data/shards/{out_prefix}_{chrom}.g.vcf.gz"
+        os.makedirs("/data/output", exist_ok=True)
+        bam_path  = f"/data/bam/{bam_stem}_{chrom}.bam"
+        ref_path  = "/data/ref/hg38.fa"
+        gvcf_path = f"/data/shards/{out_prefix}_{chrom}.g.vcf.gz"
+        vcf_path  = f"/data/output/{out_prefix}_{chrom}.vcf.gz"
 
         if not os.path.exists(bam_path):
             raise FileNotFoundError(f"[{chrom}] BAM missing in volume: {bam_path}")
 
-        cmd = [
-            "pbrun", "haplotypecaller",
-            "--ref",          ref_path,
-            "--in-bam",       bam_path,
-            "--out-variants", out_gvcf,
-            "--gvcf",
-            "--num-gpus",     "1",
-        ]
-        print(f"[{chrom}] pbrun haplotypecaller started")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"[{chrom}] failed:\n{result.stderr[-4000:]}")
-        print(f"[{chrom}] done → {out_gvcf}")
-        volume.commit()
-        return {"chrom": chrom, "gvcf": out_gvcf}
-
-    # ── Genotype: one chromosome ──────────────────────────────────────────────
-    @app.function(
-        image=image,
-        cpu=4,
-        memory=16 * 1024,
-        volumes={"/data": volume},
-        timeout=3600,
-        retries=1,
-        serialized=True,
-    )
-    def genotype_shard(chrom: str, gvcf_path: str, out_prefix: str) -> dict:
-        import subprocess, os
-        volume.reload()
-        os.makedirs("/data/output", exist_ok=True)
-        out_vcf = f"/data/output/{out_prefix}_{chrom}.vcf.gz"
-
+        # HaplotypeCaller (GPU). Skip if GVCF already present (resume path).
         if not os.path.exists(gvcf_path):
-            raise FileNotFoundError(f"[{chrom}] GVCF missing in volume: {gvcf_path}")
+            print(f"[{chrom}] pbrun haplotypecaller started")
+            result = subprocess.run(
+                ["pbrun", "haplotypecaller",
+                 "--ref",          ref_path,
+                 "--in-bam",       bam_path,
+                 "--out-variants", gvcf_path,
+                 "--gvcf",
+                 "--num-gpus",     "1"],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"[{chrom}] haplotypecaller failed:\n{result.stderr[-4000:]}")
+            print(f"[{chrom}] HC done → {gvcf_path}")
+        else:
+            print(f"[{chrom}] GVCF already exists, skipping HC")
 
-        cmd = [
-            "gatk", "GenotypeGVCFs",
-            "-R", "/data/ref/hg38.fa",
-            "-V", gvcf_path,
-            "-O", out_vcf,
-        ]
+        # GenotypeGVCFs (CPU) — runs in the same container, no extra cold-start.
         print(f"[{chrom}] GenotypeGVCFs started")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(
+            ["gatk", "GenotypeGVCFs",
+             "-R", ref_path,
+             "-V", gvcf_path,
+             "-O", vcf_path],
+            capture_output=True, text=True,
+        )
         if result.returncode != 0:
             raise RuntimeError(f"[{chrom}] GenotypeGVCFs failed:\n{result.stderr[-4000:]}")
-        print(f"[{chrom}] done → {out_vcf}")
+        print(f"[{chrom}] geno done → {vcf_path}")
         volume.commit()
-        return {"chrom": chrom, "vcf": out_vcf}
+        return {"chrom": chrom, "gvcf": gvcf_path, "vcf": vcf_path}
 
     out_prefix = strip_vcf_suffix(out_name)
 
@@ -432,45 +440,32 @@ def run_on_modal(chroms, bam_stem, out_name, ngc_key, skip_shards=False):
         print("  Setting up reference genome on Modal...")
         setup_reference.remote()
 
-        if not skip_shards:
-            print(f"  Launching {len(chroms)} parallel Parabricks shards...")
-            shard_results = list(
-                haplotypecaller_shard.starmap(
-                    [(chrom, bam_stem, out_prefix) for chrom in chroms]
-                )
-            )
-            done_chroms = {r["chrom"] for r in shard_results}
-            missing = set(chroms) - done_chroms
-            if missing:
-                raise RuntimeError(f"HaplotypeCaller failed for chromosomes: {missing}")
-            gvcf_paths = [
-                next(r["gvcf"] for r in shard_results if r["chrom"] == c)
-                for c in chroms
-            ]
-        else:
-            print(f"  Skipping shards (--skip-shards); verifying GVCFs in volume...")
-            existing = list_volume_dir("/shards")
-            gvcf_paths = []
-            for chrom in chroms:
-                name = f"{out_prefix}_{chrom}.g.vcf.gz"
-                if name not in existing:
-                    raise RuntimeError(
-                        f"--skip-shards set but GVCF missing in volume: /shards/{name}"
-                    )
-                gvcf_paths.append(f"/data/shards/{name}")
+        # skip_shards: HC outputs already present in volume; fused function
+        # detects existing GVCF and runs GenotypeGVCFs only (still on A100 —
+        # speed parity, slight cost trade).
+        label = "HC+GenotypeGVCFs" if not skip_shards else "GenotypeGVCFs (HC skipped)"
+        print(f"  Launching {len(chroms)} parallel {label} shards...")
 
-        print(f"\n  Launching {len(chroms)} parallel GenotypeGVCFs jobs...")
-        geno_results = list(
-            genotype_shard.starmap(
-                [(chrom, gvcf, out_prefix) for chrom, gvcf in zip(chroms, gvcf_paths)]
+        if skip_shards:
+            existing = list_volume_dir("/shards")
+            missing_gvcfs = [c for c in chroms
+                             if f"{out_prefix}_{c}.g.vcf.gz" not in existing]
+            if missing_gvcfs:
+                raise RuntimeError(
+                    f"--skip-shards set but GVCFs missing in volume for: {missing_gvcfs}"
+                )
+
+        shard_results = list(
+            hc_genotype_shard.starmap(
+                [(chrom, bam_stem, out_prefix) for chrom in chroms]
             )
         )
-        done_chroms = {r["chrom"] for r in geno_results}
+        done_chroms = {r["chrom"] for r in shard_results}
         missing = set(chroms) - done_chroms
         if missing:
-            raise RuntimeError(f"GenotypeGVCFs failed for chromosomes: {missing}")
+            raise RuntimeError(f"Shard failed for chromosomes: {missing}")
         vcf_paths = [
-            next(r["vcf"] for r in geno_results if r["chrom"] == c)
+            next(r["vcf"] for r in shard_results if r["chrom"] == c)
             for c in chroms
         ]
 
@@ -482,14 +477,11 @@ def run_on_modal(chroms, bam_stem, out_name, ngc_key, skip_shards=False):
 def main():
     args = parse_args()
 
-    # Credential resolution: CLI > env var > ~/.modal_gatk.env > hardcoded default
+    # Modal credentials are auto-loaded by the SDK from ~/.modal.toml
+    # (run `modal token new` once to populate). NGC key is still needed at
+    # runtime to pull the Parabricks container from nvcr.io.
     env_file = load_env_file(Path.home() / ".modal_gatk.env")
-    modal_id     = get_credential("MODAL_TOKEN_ID",     args.modal_token_id,     env_file, DEFAULT_MODAL_TOKEN_ID)
-    modal_secret = get_credential("MODAL_TOKEN_SECRET", args.modal_token_secret, env_file, DEFAULT_MODAL_TOKEN_SECRET)
-    ngc_key      = get_credential("NGC_API_KEY",        args.ngc_api_key,        env_file, DEFAULT_NGC_API_KEY)
-
-    os.environ["MODAL_TOKEN_ID"]     = modal_id
-    os.environ["MODAL_TOKEN_SECRET"] = modal_secret
+    ngc_key = get_credential("NGC_API_KEY", args.ngc_api_key, env_file)
 
     try:
         import modal  # noqa: F401
@@ -547,13 +539,15 @@ def main():
             [MODAL_BIN, "volume", "create", VOLUME_NAME],
             capture_output=True,
         )
-        vol_cache = {}
+        upload_pairs = []
         for chrom, chr_bam in chr_bams.items():
             bai_path = Path(str(chr_bam) + ".bai")
-            upload_file(chr_bam, f"/bam/{chr_bam.name}", vol_cache)
-            upload_file(bai_path, f"/bam/{chr_bam.name}.bai", vol_cache)
+            upload_pairs.append((chr_bam, f"/bam/{chr_bam.name}"))
+            upload_pairs.append((bai_path, f"/bam/{chr_bam.name}.bai"))
+        upload_files_parallel(upload_pairs, max_workers=4)
+        for chrom in chr_bams:
             manifest["uploaded"][chrom] = True
-            save_manifest(manifest)
+        save_manifest(manifest)
         print("All uploads complete.\n")
     else:
         reason = "--skip-upload" if args.skip_upload else "--skip-modal"

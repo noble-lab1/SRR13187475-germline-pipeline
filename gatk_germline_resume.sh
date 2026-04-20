@@ -6,41 +6,14 @@
 # =============================================================================
 set -euo pipefail
 
-CONDA=~/miniconda3/bin
-SRA_ID=SRR13187475
-WORKDIR=~/${SRA_ID}
-REF_DIR=~/references/hg38
-REF=${REF_DIR}/hg38.fa
-THREADS=8
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
 # Use java -jar directly to avoid the gatk wrapper's broken python shebang
 JAVA=${CONDA}/java
 GATK_JAR=$(ls ${CONDA}/../share/gatk4-*/gatk-package-*-local.jar 2>/dev/null | tail -1)
 if [ -z "${GATK_JAR}" ]; then echo "ERROR: GATK jar not found"; exit 1; fi
 gatk() { ${JAVA} -jar "${GATK_JAR}" "$@"; }
-
-GVCF=${WORKDIR}/${SRA_ID}.g.vcf.gz
-VCF_RAW=${WORKDIR}/${SRA_ID}_genotyped.vcf.gz
-SNP_RAW=${WORKDIR}/${SRA_ID}_snps_raw.vcf.gz
-INDEL_RAW=${WORKDIR}/${SRA_ID}_indels_raw.vcf.gz
-SNP_RECAL=${WORKDIR}/${SRA_ID}_snps.recal
-SNP_TRANCHES=${WORKDIR}/${SRA_ID}_snps.tranches
-SNP_RSCRIPT=${WORKDIR}/${SRA_ID}_snps_plots.R
-INDEL_RECAL=${WORKDIR}/${SRA_ID}_indels.recal
-INDEL_TRANCHES=${WORKDIR}/${SRA_ID}_indels.tranches
-INDEL_RSCRIPT=${WORKDIR}/${SRA_ID}_indels_plots.R
-VCF_SNP_VQSR=${WORKDIR}/${SRA_ID}_snps_vqsr.vcf.gz
-VCF_INDEL_VQSR=${WORKDIR}/${SRA_ID}_indels_vqsr.vcf.gz
-VCF_SNP_FINAL=${WORKDIR}/${SRA_ID}_snps_final.vcf.gz
-VCF_INDEL_FINAL=${WORKDIR}/${SRA_ID}_indels_final.vcf.gz
-
-DBSNP=${REF_DIR}/Homo_sapiens_assembly38.dbsnp138.vcf.gz
-MILLS=${REF_DIR}/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz
-HAPMAP=${REF_DIR}/hapmap_3.3.hg38.vcf.gz
-OMNI=${REF_DIR}/1000G_omni2.5.hg38.vcf.gz
-G1K_SNP=${REF_DIR}/1000G_phase1.snps.high_confidence.hg38.vcf.gz
-
-export PATH=${CONDA}:$PATH
 
 if [ ! -f "${VCF_RAW}" ]; then
   echo "ERROR: Genotyped VCF not found: ${VCF_RAW}"
@@ -107,7 +80,8 @@ gatk ApplyVQSR \
   -O ${VCF_INDEL_VQSR}
 
 # ── Hard filter fallback ──────────────────────────────────────────────────────
-echo "[3/4] Hard filter fallback (on top of VQSR)"
+# SNP + Indel filters are independent JVM processes — run concurrently.
+echo "[3/4] Hard filter fallback (on top of VQSR) — SNP + Indel in parallel"
 gatk VariantFiltration \
   -V ${VCF_SNP_VQSR} \
   --filter-expression "QD < 2.0"              --filter-name "QD2"             \
@@ -116,7 +90,8 @@ gatk VariantFiltration \
   --filter-expression "MQRankSum < -12.5"     --filter-name "MQRankSum-12.5"  \
   --filter-expression "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum-8" \
   --filter-expression "MQ0 / DP > 0.1"        --filter-name "MQ0Frac"         \
-  -O ${VCF_SNP_FINAL}
+  -O ${VCF_SNP_FINAL} &
+SNP_VF_PID=$!
 
 gatk VariantFiltration \
   -V ${VCF_INDEL_VQSR} \
@@ -124,14 +99,15 @@ gatk VariantFiltration \
   --filter-expression "FS > 200.0"             --filter-name "FS200"            \
   --filter-expression "ReadPosRankSum < -20.0" --filter-name "ReadPosRankSum-20" \
   --filter-expression "MQ0 / DP > 0.1"         --filter-name "MQ0Frac"          \
-  -O ${VCF_INDEL_FINAL}
+  -O ${VCF_INDEL_FINAL} &
+INDEL_VF_PID=$!
+
+wait ${SNP_VF_PID} ${INDEL_VF_PID}
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo "[4/4] Summary"
-SNP_PASS=$(gatk SelectVariants -V ${VCF_SNP_FINAL} --exclude-filtered \
-  -O /dev/stdout 2>/dev/null | grep -vc "^#" || echo "N/A")
-INDEL_PASS=$(gatk SelectVariants -V ${VCF_INDEL_FINAL} --exclude-filtered \
-  -O /dev/stdout 2>/dev/null | grep -vc "^#" || echo "N/A")
+SNP_PASS=$(${CONDA}/bcftools view -f PASS -H ${VCF_SNP_FINAL} 2>/dev/null | wc -l | tr -d ' ' || echo "N/A")
+INDEL_PASS=$(${CONDA}/bcftools view -f PASS -H ${VCF_INDEL_FINAL} 2>/dev/null | wc -l | tr -d ' ' || echo "N/A")
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

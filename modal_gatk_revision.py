@@ -42,10 +42,12 @@ HG38_URL = "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/hg38.fa.gz"
 # Manifest for resumability
 MANIFEST_PATH = Path.home() / ".modal_gatk_manifest.json"
 
-# ⚠️  Hardcoded credentials — ROTATE before sharing this file.
-DEFAULT_MODAL_TOKEN_ID     = "ak-8OHryx1aMl2XEwM0oknuBE"
-DEFAULT_MODAL_TOKEN_SECRET = "as-7NggUhXzihTOdJHQc1WD0R"
-DEFAULT_NGC_API_KEY        = "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"
+# Credentials removed — Modal reads ~/.modal.toml, NGC key comes from
+# ~/.modal_gatk.env or the NGC_API_KEY env var. See modal_gatk.py for the
+# canonical implementation; this revision file is kept for reference only.
+DEFAULT_MODAL_TOKEN_ID     = None
+DEFAULT_MODAL_TOKEN_SECRET = None
+DEFAULT_NGC_API_KEY        = None
 
 
 # ── Binary resolution ─────────────────────────────────────────────────────────

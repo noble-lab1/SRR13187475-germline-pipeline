@@ -2,94 +2,73 @@
 # =============================================================================
 # GATK Germline Variant Calling Pipeline — SRR13187475
 # Steps:
-#   1. Filter unique concordantly mapped pairs (MAPQ >= 20, proper pairs)
-#   2. Mark duplicates
-#   3. Download BQSR + VQSR known-sites VCFs (if not present)
-#   4. Base Quality Score Recalibration (BQSR)
-#   5. HaplotypeCaller (GVCF mode)
+#   1. Mark duplicates (on the full sorted BAM — uses all reads to anchor mates)
+#   2. Filter to unique (MAPQ >= 20) + concordantly mapped pairs
+#   3. Scatter intervals + sequence dictionary
+#   4. Base Quality Score Recalibration (BQSR), scattered
+#   5. HaplotypeCaller (GVCF mode), scattered
 #   6. GenotypeGVCFs
 #   7. Variant Quality Score Recalibration (VQSR) — SNPs then Indels
 #   8. Hard filter fallback (applied to variants that fail VQSR or if VQSR skipped)
 # =============================================================================
 set -euo pipefail
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-CONDA=~/miniconda3/bin
-SRA_ID=SRR13187475
-WORKDIR=~/${SRA_ID}
-REF_DIR=~/references/hg38
-REF=${REF_DIR}/hg38.fa
-THREADS=8
+# All paths, sample ID, and parallelism knobs live in config.sh — override any
+# of them by exporting before running (e.g. `SRA_ID=SRR24975641 ./gatk_germline.sh`).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
-BAM_IN=${WORKDIR}/${SRA_ID}_sorted.bam
+# ── Step 1: Mark Duplicates ───────────────────────────────────────────────────
+# GATK Best Practices order: duplicate marking runs on the FULL sorted BAM
+# before any quality/pair filtering. This is important because markdup uses
+# mate positions to anchor duplicates — if a mate fails MAPQ/properly-paired
+# filters and is removed first, a real PCR duplicate can be missed.
+#
+# Using samtools markdup instead of Picard/GATK MarkDuplicates: multithreaded
+# (3-5× faster on large WGS BAMs) and produces equivalent flags for downstream
+# BQSR / HaplotypeCaller. Pipeline:
+#   collate   — groups reads by name (required for mate awareness)
+#   fixmate   — adds MC/ms tags used by markdup
+#   sort      — restore coordinate order
+#   markdup   — flag 0x400 on PCR/optical duplicates; write stats
+echo "[1/8] Marking duplicates (samtools markdup) on full sorted BAM"
+MARKDUP_TMP=${WORKDIR}/.markdup_tmp
+${CONDA}/samtools collate -@ ${THREADS} -O -u ${BAM_IN} ${MARKDUP_TMP} \
+  | ${CONDA}/samtools fixmate -@ ${THREADS} -m -u - - \
+  | ${CONDA}/samtools sort    -@ ${THREADS} -u - \
+  | ${CONDA}/samtools markdup -@ ${THREADS} -s -f ${MARKDUP_METRICS} - ${BAM_MARKDUP}
 
-# BQSR known sites
-DBSNP=${REF_DIR}/Homo_sapiens_assembly38.dbsnp138.vcf.gz
-MILLS=${REF_DIR}/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz
+${CONDA}/samtools index -@ ${THREADS} ${BAM_MARKDUP}
+rm -f ${MARKDUP_TMP}.*.bam
 
-# VQSR training resources (SNPs)
-HAPMAP=${REF_DIR}/hapmap_3.3.hg38.vcf.gz
-OMNI=${REF_DIR}/1000G_omni2.5.hg38.vcf.gz
-G1K_SNP=${REF_DIR}/1000G_phase1.snps.high_confidence.hg38.vcf.gz
+echo "  Duplicate metrics: ${MARKDUP_METRICS}"
 
-# Output files
-BAM_FILTERED=${WORKDIR}/${SRA_ID}_filtered.bam
-BAM_MARKDUP=${WORKDIR}/${SRA_ID}_markdup.bam
-MARKDUP_METRICS=${WORKDIR}/${SRA_ID}_markdup_metrics.txt
-RECAL_TABLE=${WORKDIR}/${SRA_ID}_recal.table
-BAM_BQSR=${WORKDIR}/${SRA_ID}_bqsr.bam
-GVCF=${WORKDIR}/${SRA_ID}.g.vcf.gz
-VCF_RAW=${WORKDIR}/${SRA_ID}_genotyped.vcf.gz
-
-# VQSR intermediate files
-SNP_RAW=${WORKDIR}/${SRA_ID}_snps_raw.vcf.gz
-INDEL_RAW=${WORKDIR}/${SRA_ID}_indels_raw.vcf.gz
-SNP_RECAL=${WORKDIR}/${SRA_ID}_snps.recal
-SNP_TRANCHES=${WORKDIR}/${SRA_ID}_snps.tranches
-SNP_RSCRIPT=${WORKDIR}/${SRA_ID}_snps_plots.R
-INDEL_RECAL=${WORKDIR}/${SRA_ID}_indels.recal
-INDEL_TRANCHES=${WORKDIR}/${SRA_ID}_indels.tranches
-INDEL_RSCRIPT=${WORKDIR}/${SRA_ID}_indels_plots.R
-
-# Final output VCFs
-VCF_SNP_VQSR=${WORKDIR}/${SRA_ID}_snps_vqsr.vcf.gz
-VCF_INDEL_VQSR=${WORKDIR}/${SRA_ID}_indels_vqsr.vcf.gz
-
-export PATH=${CONDA}:$PATH
-
-# ── Step 1: Filter unique concordantly mapped pairs ───────────────────────────
-echo "[1/8] Filtering: unique (MAPQ >= 20) + concordantly mapped pairs"
+# ── Step 2: Filter to unique + concordantly mapped pairs ──────────────────────
+# Apply after markdup so the 0x400 dup flag is preserved on surviving reads;
+# downstream BQSR/HC respect the flag internally.
 # -f 0x2   = properly paired (concordant)
 # -q 20    = MAPQ >= 20 (unique mapping)
 # -F 0x4   = not unmapped
 # -F 0x100 = not secondary alignment
 # -F 0x800 = not supplementary alignment
+echo "[2/8] Filtering: unique (MAPQ >= 20) + concordantly mapped pairs"
 ${CONDA}/samtools view -@ ${THREADS} \
   -f 0x2 \
   -F 0x4 -F 0x100 -F 0x800 \
   -q 20 \
-  -b ${BAM_IN} \
-  | ${CONDA}/samtools sort -@ ${THREADS} -o ${BAM_FILTERED} -
+  -b ${BAM_MARKDUP} \
+  -o ${BAM_FILTERED}
 
-${CONDA}/samtools index ${BAM_FILTERED}
+${CONDA}/samtools index -@ ${THREADS} ${BAM_FILTERED}
 
-TOTAL_IN=$(${CONDA}/samtools view -c ${BAM_IN})
-TOTAL_FILT=$(${CONDA}/samtools view -c ${BAM_FILTERED})
-echo "  Reads in:      ${TOTAL_IN}"
-echo "  Reads kept:    ${TOTAL_FILT}"
+# idxstats reads only the BAM index (mapped + unmapped per ref), much faster
+# than re-walking the BAM with `samtools view -c`.
+TOTAL_IN=$(${CONDA}/samtools idxstats ${BAM_MARKDUP}   | awk '{s+=$3+$4} END {print s}')
+TOTAL_FILT=$(${CONDA}/samtools idxstats ${BAM_FILTERED} | awk '{s+=$3+$4} END {print s}')
+echo "  Reads in (markdup):  ${TOTAL_IN}"
+echo "  Reads kept:          ${TOTAL_FILT}"
 
-# ── Step 2: Mark Duplicates ───────────────────────────────────────────────────
-echo "[2/8] Marking duplicates"
-${CONDA}/gatk MarkDuplicates \
-  -I ${BAM_FILTERED} \
-  -O ${BAM_MARKDUP} \
-  -M ${MARKDUP_METRICS} \
-  --VALIDATION_STRINGENCY SILENT \
-  --CREATE_INDEX true
-
-echo "  Duplicate metrics: ${MARKDUP_METRICS}"
-
-# ── Step 3: Create sequence dictionary if missing ────────────────────────────
+# ── Step 3: Create sequence dictionary + scatter intervals ───────────────────
 if [ ! -f "${REF_DIR}/hg38.dict" ]; then
   echo "[3/8] Creating sequence dictionary for hg38..."
   ${CONDA}/gatk CreateSequenceDictionary -R ${REF}
@@ -97,50 +76,133 @@ else
   echo "[3/8] Sequence dictionary already present"
 fi
 
-# ── Step 4: Base Quality Score Recalibration (BQSR) ──────────────────────────
-# BQSR requires known-variant VCFs from the GATK resource bundle (Google Cloud
-# Storage — requires a Google account). If they are not present, BQSR is
-# skipped and the markdup BAM is used directly, which is an acceptable
-# alternative for this exercise.
-#
-# To download manually:
-#   gsutil -u YOUR_PROJECT cp gs://genomics-public-data/resources/broad/hg38/v0/\
-#     Homo_sapiens_assembly38.dbsnp138.vcf.gz ~/references/hg38/
-#   gsutil -u YOUR_PROJECT cp gs://genomics-public-data/resources/broad/hg38/v0/\
-#     Mills_and_1000G_gold_standard.indels.hg38.vcf.gz ~/references/hg38/
-#   (also download .tbi index files)
-
-if [ -f "${DBSNP}" ] && [ -f "${MILLS}" ]; then
-  echo "[4/8] BQSR — BaseRecalibrator"
-  ${CONDA}/gatk BaseRecalibrator \
-    -I ${BAM_MARKDUP} \
+# SplitIntervals produces ${SCATTER} evenly-sized .interval_list files used by
+# the parallel BQSR (step 4) and HaplotypeCaller (step 5) scatter steps.
+# SUBDIVISION_BALANCING_WITHOUT_INTERVAL_SUBDIVISION keeps intervals contiguous
+# (important for BQSR and HC — avoids cross-shard edge effects at break points).
+if [ ! -d "${INTERVALS_DIR}" ] || [ -z "$(ls -A ${INTERVALS_DIR} 2>/dev/null)" ]; then
+  echo "  Scattering intervals (${SCATTER} shards)..."
+  mkdir -p ${INTERVALS_DIR}
+  ${CONDA}/gatk SplitIntervals \
     -R ${REF} \
-    --known-sites ${DBSNP} \
-    --known-sites ${MILLS} \
-    -O ${RECAL_TABLE}
-
-  echo "[4/8] BQSR — ApplyBQSR"
-  ${CONDA}/gatk ApplyBQSR \
-    -I ${BAM_MARKDUP} \
-    -R ${REF} \
-    --bqsr-recal-file ${RECAL_TABLE} \
-    -O ${BAM_BQSR}
+    --scatter-count ${SCATTER} \
+    --subdivision-mode BALANCING_WITHOUT_INTERVAL_SUBDIVISION \
+    -O ${INTERVALS_DIR}
 else
-  echo "[4/8] BQSR resource VCFs not found — skipping BQSR"
-  echo "  NOTE: Using markdup BAM directly. Base quality scores will not be recalibrated."
-  echo "  To enable BQSR, download the GATK resource bundle (requires Google account)."
-  echo "  See comments in this script for download instructions."
-  BAM_BQSR=${BAM_MARKDUP}
+  echo "  Scatter intervals already present (${INTERVALS_DIR})"
 fi
 
-# ── Step 5: HaplotypeCaller (GVCF mode) ──────────────────────────────────────
-echo "[5/8] HaplotypeCaller (GVCF mode)"
-${CONDA}/gatk HaplotypeCaller \
-  -R ${REF} \
-  -I ${BAM_BQSR} \
-  -O ${GVCF} \
-  -ERC GVCF \
-  --native-pair-hmm-threads ${THREADS}
+# ── Step 4: Base Quality Score Recalibration (BQSR) ──────────────────────────
+# BQSR requires known-variant VCFs from the GATK resource bundle. If they are
+# not present, BQSR is skipped and the markdup BAM is used directly.
+#
+# Public (no requester-pays, no billing project needed):
+#   BASE=gs://gcp-public-data--broad-references/hg38/v0
+#   gcloud storage cp \
+#     $BASE/Homo_sapiens_assembly38.dbsnp138.vcf.gz{,.tbi} \
+#     $BASE/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz{,.tbi} \
+#     $BASE/hapmap_3.3.hg38.vcf.gz{,.tbi} \
+#     $BASE/1000G_omni2.5.hg38.vcf.gz{,.tbi} \
+#     $BASE/1000G_phase1.snps.high_confidence.hg38.vcf.gz{,.tbi} \
+#     ~/references/hg38/
+
+if [ -f "${DBSNP}" ] && [ -f "${MILLS}" ]; then
+  mkdir -p ${BQSR_SHARDS_DIR}
+
+  # Exported for the bash -c subshell used by xargs -P below.
+  export CONDA REF BAM_FILTERED DBSNP MILLS RECAL_TABLE BAM_BQSR BQSR_SHARDS_DIR
+
+  # Per-shard BaseRecalibrator: each shard writes a small recal table that is
+  # later merged with GatherBQSRReports.
+  bqsr_base_shard() {
+    local interval=$1
+    local name; name=$(basename "$interval" .interval_list)
+    ${CONDA}/gatk BaseRecalibrator \
+      -I ${BAM_FILTERED} \
+      -R ${REF} \
+      -L "$interval" \
+      --known-sites ${DBSNP} \
+      --known-sites ${MILLS} \
+      -O ${BQSR_SHARDS_DIR}/recal_${name}.table \
+      >/dev/null 2>&1 && echo "  [base/$name] done" \
+      || { echo "  [base/$name] FAILED"; exit 1; }
+  }
+  export -f bqsr_base_shard
+
+  # Per-shard ApplyBQSR: each shard writes a piece of the recalibrated BAM,
+  # later concatenated with GatherBamFiles.
+  bqsr_apply_shard() {
+    local interval=$1
+    local name; name=$(basename "$interval" .interval_list)
+    ${CONDA}/gatk ApplyBQSR \
+      -I ${BAM_FILTERED} \
+      -R ${REF} \
+      -L "$interval" \
+      --bqsr-recal-file ${RECAL_TABLE} \
+      -O ${BQSR_SHARDS_DIR}/bqsr_${name}.bam \
+      >/dev/null 2>&1 && echo "  [apply/$name] done" \
+      || { echo "  [apply/$name] FAILED"; exit 1; }
+  }
+  export -f bqsr_apply_shard
+
+  echo "[4/8] BQSR — BaseRecalibrator (${SCATTER}-way scatter, ${THREADS} parallel)"
+  find ${INTERVALS_DIR} -name "*.interval_list" -print0 \
+    | xargs -0 -n 1 -P ${THREADS} -I{} bash -c 'bqsr_base_shard "$@"' _ {}
+
+  echo "[4/8] BQSR — GatherBQSRReports"
+  ${CONDA}/gatk GatherBQSRReports \
+    $(for f in $(ls ${BQSR_SHARDS_DIR}/recal_*.table | sort); do printf -- "-I %s " "$f"; done) \
+    -O ${RECAL_TABLE}
+
+  echo "[4/8] BQSR — ApplyBQSR (${SCATTER}-way scatter, ${THREADS} parallel)"
+  find ${INTERVALS_DIR} -name "*.interval_list" -print0 \
+    | xargs -0 -n 1 -P ${THREADS} -I{} bash -c 'bqsr_apply_shard "$@"' _ {}
+
+  echo "[4/8] BQSR — GatherBamFiles"
+  ${CONDA}/gatk GatherBamFiles \
+    $(for f in $(ls ${BQSR_SHARDS_DIR}/bqsr_*.bam | sort); do printf -- "-I %s " "$f"; done) \
+    -O ${BAM_BQSR} \
+    --CREATE_INDEX true
+else
+  echo "[4/8] BQSR resource VCFs not found — skipping BQSR"
+  echo "  NOTE: Using filtered BAM directly. Base quality scores will not be recalibrated."
+  echo "  To enable BQSR, download the GATK resource bundle (see comments above)."
+  BAM_BQSR=${BAM_FILTERED}
+fi
+
+# ── Step 5: HaplotypeCaller (GVCF mode, scattered) ───────────────────────────
+# HC is the wall-clock dominator and is effectively single-threaded —
+# --native-pair-hmm-threads only accelerates the PairHMM inner loop, not the
+# assembly/active-region stages. Scattering across ${SCATTER} intervals and
+# running ${THREADS} in parallel gives a near-linear speedup.
+# Each shard uses --native-pair-hmm-threads 1 (more shard parallelism > SIMD).
+mkdir -p ${HC_SHARDS_DIR}
+
+export CONDA REF BAM_BQSR HC_SHARDS_DIR
+
+hc_shard() {
+  local interval=$1
+  local name; name=$(basename "$interval" .interval_list)
+  ${CONDA}/gatk HaplotypeCaller \
+    -R ${REF} \
+    -I ${BAM_BQSR} \
+    -L "$interval" \
+    -O ${HC_SHARDS_DIR}/shard_${name}.g.vcf.gz \
+    -ERC GVCF \
+    --native-pair-hmm-threads 1 \
+    >/dev/null 2>&1 && echo "  [hc/$name] done" \
+    || { echo "  [hc/$name] FAILED"; exit 1; }
+}
+export -f hc_shard
+
+echo "[5/8] HaplotypeCaller (${SCATTER}-way scatter, ${THREADS} parallel)"
+find ${INTERVALS_DIR} -name "*.interval_list" -print0 \
+  | xargs -0 -n 1 -P ${THREADS} -I{} bash -c 'hc_shard "$@"' _ {}
+
+echo "[5/8] HaplotypeCaller — MergeVcfs (GVCF)"
+${CONDA}/gatk MergeVcfs \
+  $(for f in $(ls ${HC_SHARDS_DIR}/shard_*.g.vcf.gz | sort); do printf -- "-I %s " "$f"; done) \
+  -O ${GVCF}
 
 # ── Step 6: GenotypeGVCFs ─────────────────────────────────────────────────────
 echo "[6/8] GenotypeGVCFs"
@@ -232,9 +294,6 @@ fi  # end VQSR block
 # This step additionally applies hard filters as a safety net.
 echo "[8/8] Hard filter fallback on VQSR output"
 
-VCF_SNP_FINAL=${WORKDIR}/${SRA_ID}_snps_final.vcf.gz
-VCF_INDEL_FINAL=${WORKDIR}/${SRA_ID}_indels_final.vcf.gz
-
 # Allele Balance (AB): for het calls, alt allele fraction should be 0.2–0.8.
 # Uses JEXL to access the AD (allele depth) FORMAT field. Only applied to hets
 # — homozygous alt calls are expected to have near-100% alt reads.
@@ -242,6 +301,7 @@ VCF_INDEL_FINAL=${WORKDIR}/${SRA_ID}_indels_final.vcf.gz
 # a repetitive/low-complexity region prone to mismapping artifacts.
 # MQ0 filter applied as a fraction of total depth (MQ0 / DP > 0.1).
 
+# SNP + Indel VariantFiltration are independent — run concurrently.
 ${CONDA}/gatk VariantFiltration \
   -V ${VCF_SNP_VQSR} \
   --filter-expression "QD < 2.0"              --filter-name "QD2"             \
@@ -252,7 +312,8 @@ ${CONDA}/gatk VariantFiltration \
   --filter-expression "MQ0 / DP > 0.1"        --filter-name "MQ0Frac"         \
   --filter-expression "vc.isHet() && (vc.getGenotype(0).getAD()[1] * 1.0 / (vc.getGenotype(0).getAD()[0] + vc.getGenotype(0).getAD()[1]) < 0.2 || vc.getGenotype(0).getAD()[1] * 1.0 / (vc.getGenotype(0).getAD()[0] + vc.getGenotype(0).getAD()[1]) > 0.8)" \
     --filter-name "ABfilter" \
-  -O ${VCF_SNP_FINAL}
+  -O ${VCF_SNP_FINAL} &
+SNP_VF_PID=$!
 
 ${CONDA}/gatk VariantFiltration \
   -V ${VCF_INDEL_VQSR} \
@@ -262,7 +323,10 @@ ${CONDA}/gatk VariantFiltration \
   --filter-expression "MQ0 / DP > 0.1"         --filter-name "MQ0Frac"          \
   --filter-expression "vc.isHet() && (vc.getGenotype(0).getAD()[1] * 1.0 / (vc.getGenotype(0).getAD()[0] + vc.getGenotype(0).getAD()[1]) < 0.2 || vc.getGenotype(0).getAD()[1] * 1.0 / (vc.getGenotype(0).getAD()[0] + vc.getGenotype(0).getAD()[1]) > 0.8)" \
     --filter-name "ABfilter" \
-  -O ${VCF_INDEL_FINAL}
+  -O ${VCF_INDEL_FINAL} &
+INDEL_VF_PID=$!
+
+wait ${SNP_VF_PID} ${INDEL_VF_PID}
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
@@ -285,10 +349,10 @@ echo "  SNP VQSR R plots:                      ${SNP_RSCRIPT}"
 echo "  Indel VQSR R plots:                    ${INDEL_RSCRIPT}"
 echo ""
 
-SNP_PASS=$(${CONDA}/gatk SelectVariants -V ${VCF_SNP_FINAL} --exclude-filtered \
-  -O /dev/stdout 2>/dev/null | grep -vc "^#" || echo "N/A")
-INDEL_PASS=$(${CONDA}/gatk SelectVariants -V ${VCF_INDEL_FINAL} --exclude-filtered \
-  -O /dev/stdout 2>/dev/null | grep -vc "^#" || echo "N/A")
+# bcftools reads the bgzipped VCF directly via htslib (no double-decompression,
+# no JVM startup) — ~20× faster than the SelectVariants+grep approach.
+SNP_PASS=$(${CONDA}/bcftools view -f PASS -H ${VCF_SNP_FINAL} 2>/dev/null | wc -l | tr -d ' ' || echo "N/A")
+INDEL_PASS=$(${CONDA}/bcftools view -f PASS -H ${VCF_INDEL_FINAL} 2>/dev/null | wc -l | tr -d ' ' || echo "N/A")
 echo "  PASS SNPs:   ${SNP_PASS}"
 echo "  PASS Indels: ${INDEL_PASS}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

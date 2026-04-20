@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
-"""Quick connectivity test for Modal + NGC Parabricks."""
-import os, sys
+"""Quick connectivity test for Modal + NGC Parabricks.
 
-os.environ["MODAL_TOKEN_ID"]     = "ak-8OHryx1aMl2XEwM0oknuBE"
-os.environ["MODAL_TOKEN_SECRET"] = "as-7NggUhXzihTOdJHQc1WD0R"
-NGC_KEY = "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"
+Credentials:
+  Modal: auto-loaded from ~/.modal.toml (`modal token new` once)
+  NGC:   env var NGC_API_KEY, or ~/.modal_gatk.env
+"""
+import os, sys
+from pathlib import Path
+
+# Load NGC key from ~/.modal_gatk.env if not already in env
+NGC_KEY = os.environ.get("NGC_API_KEY")
+if not NGC_KEY:
+    env_file = Path.home() / ".modal_gatk.env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if line.startswith("NGC_API_KEY="):
+                NGC_KEY = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+if not NGC_KEY:
+    sys.exit("ERROR: NGC_API_KEY not set (env var or ~/.modal_gatk.env)")
 
 import modal
 

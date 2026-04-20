@@ -59,3 +59,11 @@ __pycache__/
 # ── Peak calls and counts (large/regenerable) ─────────────────────────────────
 macs3_out/
 tss_pm1000_counts.bed
+
+# ── Secrets (never commit) ────────────────────────────────────────────────────
+*.env
+.env
+.env.*
+secrets/
+*_credentials*
+modal_gatk.env
