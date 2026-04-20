@@ -258,19 +258,11 @@ def upload_file(local_path: Path, remote_path: str, vol_cache: dict, retries: in
                 raise RuntimeError(f"Upload failed after {retries} attempts: {e}")
 
 
-def vol_path(container_path: str) -> str:
-    """Translate an in-container path (/data/foo) to a volume-root CLI path (/foo)."""
-    if container_path.startswith("/data/"):
-        return container_path[len("/data"):]
-    return container_path
-
-
 def download_file(remote_path: str, local_path: Path, required: bool = True) -> bool:
     """Download a file from volume. Returns True on success."""
-    cli_path = vol_path(remote_path)
-    print(f"  ↓ {Path(cli_path).name} → {local_path}")
+    print(f"  ↓ {Path(remote_path).name} → {local_path}")
     result = subprocess.run(
-        [MODAL_BIN, "volume", "get", VOLUME_NAME, cli_path, str(local_path)],
+        [MODAL_BIN, "volume", "get", VOLUME_NAME, remote_path, str(local_path)],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -576,13 +568,13 @@ def main():
         save_manifest(manifest)
     else:
         print("Step 3/5 — Skipping Modal run (--skip-modal)")
-        remote_vcf_paths = [f"/data/output/{out_prefix}_{c}.vcf.gz" for c in chroms]  # translated by vol_path()
+        remote_vcf_paths = [f"/data/output/{out_prefix}_{c}.vcf.gz" for c in chroms]
 
     # ── Step 4: Download per-chrom VCFs ──────────────────────────────────────
     vcf_dir = out.parent / "chr_vcfs"
     vcf_dir.mkdir(exist_ok=True)
     local_vcfs = []
-    if not args.skip_download:
+    if not args.skip_download and not args.skip_modal:
         print(f"\nStep 4/5 — Downloading {len(remote_vcf_paths)} per-chromosome VCFs...")
         for chrom, remote_path in zip(chroms, remote_vcf_paths):
             local_vcf = vcf_dir / f"{out_prefix}_{chrom}.vcf.gz"
@@ -595,7 +587,8 @@ def main():
             manifest["downloaded"][chrom] = str(local_vcf)
             save_manifest(manifest)
     else:
-        print("Step 4/5 — Skipping download (--skip-download)")
+        reason = "--skip-download" if args.skip_download else "--skip-modal"
+        print(f"Step 4/5 — Skipping download ({reason})")
         local_vcfs = [vcf_dir / f"{out_prefix}_{c}.vcf.gz" for c in chroms]
         for v in local_vcfs:
             if not v.exists():
@@ -607,18 +600,13 @@ def main():
         return
 
     print(f"\nStep 5/5 — Merging {len(local_vcfs)} VCFs with GATK MergeVcfs...")
-    java = find_binary("java", ["~/miniconda3/bin/java", "/usr/bin/java"])
-    # Locate GATK jar — prefer conda install, fall back to any jar on PATH
-    gatk_jar_candidates = list(Path(os.path.expanduser("~/miniconda3/share")).glob("gatk4-*/gatk-package-*-local.jar"))
-    if not gatk_jar_candidates:
-        sys.exit("ERROR: could not find GATK jar under ~/miniconda3/share/gatk4-*/")
-    gatk_jar = str(sorted(gatk_jar_candidates)[-1])
+    gatk = find_binary("gatk", ["~/miniconda3/bin/gatk", "/usr/local/bin/gatk"])
     merge_inputs = []
     for vcf in local_vcfs:
         merge_inputs += ["-I", str(vcf)]
     merged = out.parent / (strip_vcf_suffix(out.name) + "_genotyped.vcf.gz")
     result = subprocess.run(
-        [java, "-jar", gatk_jar, "MergeVcfs", *merge_inputs, "-O", str(merged)],
+        [gatk, "MergeVcfs", *merge_inputs, "-O", str(merged)],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
